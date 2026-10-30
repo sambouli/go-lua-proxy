@@ -10,6 +10,9 @@ local host = proxy.host()
 
 proxy.log("request: " .. method .. " " .. path .. " from " .. ip)
 
+-- Inject client IP into every proxied response
+proxy.setResponseHeader("X-Client-IP", ip)
+
 -- 2. Auth check — require X-API-Key header
 local apiKey = proxy.getHeader("X-Api-Key")
 if apiKey ~= "" then
