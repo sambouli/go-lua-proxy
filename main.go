@@ -1,3 +1,79 @@
+// go-lua-proxy is a lightweight HTTP reverse proxy that executes Lua scripts
+// per-request, giving programmatic control over routing, auth, headers, body
+// transformation, and more.
+//
+// # Configuration
+//
+// The proxy is configured entirely via environment variables:
+//
+//	LISTEN_ADDR=:8080        Address to listen on (default :8080)
+//	UPSTREAM=http://backend  Backend URL to proxy to (required)
+//	LUA_SCRIPTS=./a.lua,...  Comma-separated list of Lua script files
+//
+// # Lua API
+//
+// Each loaded script runs inside a fresh Lua state with one global table: `proxy`.
+// Every request creates a new Lua state; globals do NOT persist between requests.
+//
+// ## Request info (read-only)
+//
+//	proxy.request.method   — "GET", "POST", etc.
+//	proxy.request.path     — URL path
+//	proxy.request.rawPath  — path as received (encoded chars preserved)
+//	proxy.request.proto    — "HTTP/1.1", "HTTP/2.0"
+//
+//	proxy.getHeader(key)       — request header value (comma-joined for multi-value)
+//	proxy.getQuery(key)        — URL query parameter value
+//	proxy.clientIP()           — real client IP (X-Real-Ip → X-Forwarded-For[0] → RemoteAddr)
+//	proxy.remoteAddr()         — raw peer address, e.g. "127.0.0.1:54321"
+//	proxy.scheme()             — "http" or "https" (respects X-Forwarded-Proto, checks TLS)
+//	proxy.host()               — Host header value
+//	proxy.upstreamURL()        — the configured UPSTREAM value
+//
+// ## Response manipulation (merged into proxied response)
+//
+// These set fields on api.Response without short-circuiting. Headers are merged
+// into the upstream response by ModifyResponse.
+//
+//	proxy.setStatus(code)                    — set HTTP status code
+//	proxy.setResponseHeader(name, value)     — add a response header
+//
+// ## Body manipulation
+//
+//	proxy.getBody()    — return the request body as a string
+//	proxy.setBody(str) — replace the request body before forwarding
+//
+// ## Short-circuit (bypass upstream entirely)
+//
+// These methods stop the request from reaching the backend and send a response directly.
+//
+//	proxy.redirect(location, statusCode?)  — redirect (default 302)
+//	proxy.abort(statusCode, body?)         — abort with custom status + body (default 403)
+//
+//	Example: proxy.abort(200, `{"status":"ok"}`)
+//	Example: proxy.redirect("/login", 302)
+//
+// ## JSON helpers
+//
+//	proxy.jsonDecode(str) → table, error  — parse JSON string → Lua table
+//	proxy.jsonEncode(table) → str, error  — encode Lua table → JSON string
+//
+// Numbers stay as numbers (not strings), booleans stay boolean, nil stays nil.
+//
+// ## Logging
+//
+//	proxy.log(msg) — prints to proxy stderr log
+//
+// # Stats endpoint
+//
+// GET /__proxy_stats__ returns JSON with total_requests, status_codes, avg_latency_ms, etc.
+//
+// # Limitations
+//
+// - No cross-request state: each request gets a new Lua state. For persistent state
+//   (rate limiting, caching), use an external store reachable via HTTP from Lua.
+// - Body size limit: request bodies are read up to 10 MB before being passed to Lua.
+// - Single upstream: this is a single-host reverse proxy, not a load balancer.
 package main
 
 import (
@@ -23,13 +99,15 @@ import (
 
 // --- Config ---
 
+// Config holds the proxy configuration loaded from environment variables.
 type Config struct {
-	ListenAddr    string
-	Upstream      string
-	LuaScripts    map[string]string // path -> source
-	ScriptTimeout time.Duration
+	ListenAddr    string            // Address to listen on (LISTEN_ADDR)
+	Upstream      string            // Backend URL to proxy to (UPSTREAM)
+	LuaScripts    map[string]string // Map of file path -> source content (LUA_SCRIPTS)
+	ScriptTimeout time.Duration     // Max execution time per script (reserved)
 }
 
+// loadConfig reads configuration from environment variables.
 func loadConfig() Config {
 	cfg := Config{
 		ListenAddr:    getEnv("LISTEN_ADDR", ":8080"),
@@ -53,6 +131,8 @@ func loadConfig() Config {
 	return cfg
 }
 
+// getEnv returns the value of the environment variable named by key,
+// or fallback if the variable is unset or empty.
 func getEnv(key, fallback string) string {
 	if v := os.Getenv(key); v != "" {
 		return v
@@ -61,6 +141,7 @@ func getEnv(key, fallback string) string {
 }
 
 // LVIsNil checks if a stack value is nil (using negative index).
+// This is needed because gopher-lua's IsNoneOrNil doesn't work with negative indices.
 func LVIsNil(L *lua.LState, idx int) bool {
 	v := L.Get(idx)
 	return v == lua.LNil
@@ -68,12 +149,14 @@ func LVIsNil(L *lua.LState, idx int) bool {
 
 // --- Proxy state ---
 
+// ProxyState holds shared statistics across all requests.
 type ProxyState struct {
 	mu       sync.RWMutex
 	stats    ProxyStats
 	requests uint64
 }
 
+// ProxyStats tracks aggregate request metrics.
 type ProxyStats struct {
 	TotalRequests uint64            `json:"total_requests"`
 	TotalBytesIn  uint64            `json:"total_bytes_in"`
@@ -91,21 +174,25 @@ var state = &ProxyState{
 
 // --- Lua API ---
 
+// LuaAPI exposes request/response context to Lua scripts.
+// Each field is populated per-request and accessible from within Lua via the `proxy` global.
 type LuaAPI struct {
-	Request     *http.Request
-	Response    *http.Response
-	Body        []byte
-	Headers     map[string]string
-	QueryArgs   map[string]string
-	Cancel      func()
-	Blocked     bool // true if script called abort or redirect
-	UpstreamURL string // configured upstream URL
+	Request     *http.Request // Original HTTP request
+	Response    *http.Response // Response set by script (nil = proxy normally)
+	Body        []byte         // Request body for inspection/modification
+	Headers     map[string]string // All request headers (comma-joined multi-values)
+	QueryArgs   map[string]string // URL query parameters
+	Cancel      func()         // Cancel the script execution context
+	Blocked     bool           // true if script called abort() or redirect() — short-circuit
+	UpstreamURL string         // The configured UPSTREAM value, available to scripts
 }
 
+// registerLuaAPI populates the Lua state with the `proxy` global table containing
+// all functions and data available to scripts. Called once per request.
 func registerLuaAPI(L *lua.LState, api *LuaAPI) {
 	m := L.NewTable()
 
-	// request info
+	// request info — read-only metadata about the incoming request
 	reqTbl := L.NewTable()
 	L.SetField(reqTbl, "method", lua.LString(api.Request.Method))
 	L.SetField(reqTbl, "path", lua.LString(api.Request.URL.Path))
@@ -113,7 +200,7 @@ func registerLuaAPI(L *lua.LState, api *LuaAPI) {
 	L.SetField(reqTbl, "proto", lua.LString(api.Request.Proto))
 	L.SetField(m, "request", reqTbl)
 
-	// headers helpers
+	// getHeader — look up a request header by name
 	headersFn := L.NewFunction(func(L *lua.LState) int {
 		key := L.CheckString(1)
 		L.Push(lua.LString(api.Headers[key]))
@@ -121,6 +208,7 @@ func registerLuaAPI(L *lua.LState, api *LuaAPI) {
 	})
 	L.SetField(m, "getHeader", headersFn)
 
+	// getQuery — look up a URL query parameter by name
 	queryFn := L.NewFunction(func(L *lua.LState) int {
 		key := L.CheckString(1)
 		L.Push(lua.LString(api.QueryArgs[key]))
@@ -128,7 +216,7 @@ func registerLuaAPI(L *lua.LState, api *LuaAPI) {
 	})
 	L.SetField(m, "getQuery", queryFn)
 
-	// response helpers
+	// response.status — current response status (0 if not yet set)
 	respTbl := L.NewTable()
 	if api.Response != nil {
 		L.SetField(respTbl, "status", lua.LNumber(api.Response.StatusCode))
@@ -137,6 +225,7 @@ func registerLuaAPI(L *lua.LState, api *LuaAPI) {
 	}
 	L.SetField(m, "response", respTbl)
 
+	// setStatus — set the HTTP status code for the response
 	respSetFn := L.NewFunction(func(L *lua.LState) int {
 		status := L.CheckInt(1)
 		api.Response = &http.Response{StatusCode: status}
@@ -145,6 +234,8 @@ func registerLuaAPI(L *lua.LState, api *LuaAPI) {
 	})
 	L.SetField(m, "setStatus", respSetFn)
 
+	// setResponseHeader — add a response header. If called multiple times,
+	// headers accumulate in the same Header map.
 	respHdrFn := L.NewFunction(func(L *lua.LState) int {
 		key := L.CheckString(1)
 		val := L.CheckString(2)
@@ -160,13 +251,14 @@ func registerLuaAPI(L *lua.LState, api *LuaAPI) {
 	})
 	L.SetField(m, "setResponseHeader", respHdrFn)
 
-	// body manipulation
+	// getBody — return the full request body as a string
 	bodyFn := L.NewFunction(func(L *lua.LState) int {
 		L.Push(lua.LString(string(api.Body)))
 		return 1
 	})
 	L.SetField(m, "getBody", bodyFn)
 
+	// setBody — replace the request body before forwarding to upstream
 	bodySetFn := L.NewFunction(func(L *lua.LState) int {
 		api.Body = []byte(L.CheckString(1))
 		L.Push(lua.LTrue)
@@ -174,7 +266,8 @@ func registerLuaAPI(L *lua.LState, api *LuaAPI) {
 	})
 	L.SetField(m, "setBody", bodySetFn)
 
-	// redirect
+	// redirect — short-circuit with an HTTP redirect response.
+	// Usage: proxy.redirect(location) or proxy.redirect(location, statusCode)
 	redirectFn := L.NewFunction(func(L *lua.LState) int {
 		loc := L.CheckString(1)
 		code := 302
@@ -191,7 +284,9 @@ func registerLuaAPI(L *lua.LState, api *LuaAPI) {
 	})
 	L.SetField(m, "redirect", redirectFn)
 
-	// abort / error — usage: proxy.abort(code, msg)
+	// abort — short-circuit with an arbitrary status code and body.
+	// Usage: proxy.abort(), proxy.abort(statusCode), proxy.abort(statusCode, body)
+	// Default is 403 "blocked by script".
 	abortFn := L.NewFunction(func(L *lua.LState) int {
 		code := 403
 		msg := "blocked by script"
@@ -214,7 +309,7 @@ func registerLuaAPI(L *lua.LState, api *LuaAPI) {
 	})
 	L.SetField(m, "abort", abortFn)
 
-	// log helper
+	// log — print a message to the proxy's stderr log
 	logFn := L.NewFunction(func(L *lua.LState) int {
 		msg := L.CheckString(1)
 		log.Printf("[lua] %s", msg)
@@ -224,7 +319,8 @@ func registerLuaAPI(L *lua.LState, api *LuaAPI) {
 
 	// --- Network / connection info ---
 
-	// proxy.clientIP() — resolves real client IP from X-Forwarded-For / X-Real-Ip / RemoteAddr
+	// clientIP — resolve the real client IP address.
+	// Priority: X-Real-Ip → first entry of X-Forwarded-For → RemoteAddr (port stripped).
 	clientIPFn := L.NewFunction(func(L *lua.LState) int {
 		ip := api.Request.Header.Get("X-Real-Ip")
 		if ip == "" {
@@ -246,20 +342,20 @@ func registerLuaAPI(L *lua.LState, api *LuaAPI) {
 	})
 	L.SetField(m, "clientIP", clientIPFn)
 
-	// proxy.remoteAddr() — raw RemoteAddr of the direct peer
+	// remoteAddr — raw RemoteAddr of the direct peer (includes port)
 	remoteAddrFn := L.NewFunction(func(L *lua.LState) int {
 		L.Push(lua.LString(api.Request.RemoteAddr))
 		return 1
 	})
 	L.SetField(m, "remoteAddr", remoteAddrFn)
 
-	// proxy.scheme() — "http" or "https"
+	// scheme — "http" or "https". Respects X-Forwarded-Proto header,
+	// falls back to checking TLS on the request.
 	schemeFn := L.NewFunction(func(L *lua.LState) int {
 		scheme := "http"
 		if api.Request.TLS != nil {
 			scheme = "https"
 		}
-		// Respect X-Forwarded-Proto if present
 		if xfp := api.Request.Header.Get("X-Forwarded-Proto"); xfp != "" {
 			scheme = xfp
 		}
@@ -268,39 +364,22 @@ func registerLuaAPI(L *lua.LState, api *LuaAPI) {
 	})
 	L.SetField(m, "scheme", schemeFn)
 
-	// proxy.host() — the Host header value
+	// host — the Host header value from the request
 	hostFn := L.NewFunction(func(L *lua.LState) int {
 		L.Push(lua.LString(api.Request.Host))
 		return 1
 	})
 	L.SetField(m, "host", hostFn)
 
-	// proxy.upstreamURL() — the configured upstream URL
+	// upstreamURL — the configured UPSTREAM URL value
 	upstreamURLFn := L.NewFunction(func(L *lua.LState) int {
 		L.Push(lua.LString(api.UpstreamURL))
 		return 1
 	})
 	L.SetField(m, "upstreamURL", upstreamURLFn)
 
-	// proxy.setBodyStream(reader) — set body to an io.ReadCloser (advanced)
-	bodyStreamFn := L.NewFunction(func(L *lua.LState) int {
-		ud := L.CheckUserData(1)
-		if reader, ok := ud.Value.(io.ReadCloser); ok {
-			buf, err := io.ReadAll(reader)
-			reader.Close()
-			if err != nil {
-				L.Push(lua.LNil)
-				L.Push(lua.LString(err.Error()))
-				return 2
-			}
-			api.Body = buf
-		}
-		L.Push(lua.LTrue)
-		return 1
-	})
-	L.SetField(m, "setBodyStream", bodyStreamFn)
-
-	// json decode
+	// jsonDecode — parse a JSON string into a Lua table.
+	// Returns (table) on success, (nil, error_string) on failure.
 	jsonDecodeFn := L.NewFunction(func(L *lua.LState) int {
 		raw := L.CheckString(1)
 		var out interface{}
@@ -314,7 +393,8 @@ func registerLuaAPI(L *lua.LState, api *LuaAPI) {
 	})
 	L.SetField(m, "jsonDecode", jsonDecodeFn)
 
-	// json encode
+	// jsonEncode — encode a Lua table into a JSON string.
+	// Returns (json_string) on success, (nil, error_string) on failure.
 	jsonEncodeFn := L.NewFunction(func(L *lua.LState) int {
 		t := L.CheckTable(1)
 		v := valueFromTable(L, t)
@@ -334,6 +414,8 @@ func registerLuaAPI(L *lua.LState, api *LuaAPI) {
 
 // --- Table <-> Go value helpers ---
 
+// tableFromValue converts a Go value (typically from JSON unmarshal) into a Lua table.
+// Handles nested maps, slices, primitives, and nil.
 func tableFromValue(L *lua.LState, v interface{}) *lua.LTable {
 	t := L.NewTable()
 	switch vt := v.(type) {
@@ -347,7 +429,7 @@ func tableFromValue(L *lua.LState, v interface{}) *lua.LTable {
 	return t
 }
 
-// valueToLua converts a Go value (from JSON unmarshal) into an LValue.
+// valueToLua converts a single Go value into an appropriate Lua LValue.
 func valueToLua(L *lua.LState, v interface{}) lua.LValue {
 	switch vt := v.(type) {
 	case map[string]interface{}:
@@ -371,7 +453,7 @@ func valueToLua(L *lua.LState, v interface{}) lua.LValue {
 	}
 }
 
-// sliceToLua converts a []interface{} (from JSON unmarshal) into a Lua table.
+// sliceToLua converts a Go slice into a Lua table with integer keys starting at 1.
 func sliceToLua(L *lua.LState, vt []interface{}) *lua.LTable {
 	arr := L.NewTable()
 	for i, item := range vt {
@@ -380,6 +462,7 @@ func sliceToLua(L *lua.LState, vt []interface{}) *lua.LTable {
 	return arr
 }
 
+// valueFromTable converts a Lua table back into a Go value for JSON encoding.
 func valueFromTable(L *lua.LState, t *lua.LTable) interface{} {
 	result := make(map[string]interface{})
 	t.ForEach(func(k, v lua.LValue) {
@@ -406,6 +489,9 @@ func valueFromTable(L *lua.LState, t *lua.LTable) interface{} {
 
 // --- Script runner ---
 
+// ScriptRunner executes Lua scripts in isolated states. Each call creates a new
+// Lua VM, registers the per-request API, and runs the script. Errors are returned
+// so the caller can decide how to handle them.
 type ScriptRunner struct{}
 
 func NewScriptRunner() *ScriptRunner {
@@ -426,6 +512,7 @@ func (sr *ScriptRunner) Run(script string, api *LuaAPI) error {
 
 // --- Handlers ---
 
+// statsHandler serves aggregate request statistics as JSON at /__proxy_stats__.
 func statsHandler(w http.ResponseWriter, r *http.Request) {
 	if r.URL.Path != "/__proxy_stats__" {
 		http.NotFound(w, r)
@@ -448,6 +535,8 @@ func main() {
 		log.Fatalf("parse upstream: %v", err)
 	}
 
+	// httputil.ReverseProxy forwards requests to the upstream server.
+	// We customize Director (rewrite URL) and ModifyResponse (merge Lua-set headers).
 	proxy := httputil.NewSingleHostReverseProxy(upstream)
 
 	runner := NewScriptRunner()
@@ -458,6 +547,8 @@ func main() {
 		WriteTimeout: 30 * time.Second,
 		IdleTimeout:  60 * time.Second,
 	}
+
+	// Main request handler: run Lua scripts, then proxy.
 	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
 		state.mu.Lock()
@@ -465,30 +556,34 @@ func main() {
 		state.stats.TotalRequests++
 		state.mu.Unlock()
 
-		// Build Lua API for this request
+		// Build Lua API object for this request.
 		api := &LuaAPI{
 			Request:     r,
 			Headers:     make(map[string]string),
 			QueryArgs:   make(map[string]string),
 			UpstreamURL: cfg.Upstream,
 		}
+		// Copy all request headers (multi-value joined with ", ")
 		for k, vals := range r.Header {
 			api.Headers[k] = strings.Join(vals, ", ")
 		}
+		// Copy all query parameters
 		for k, vals := range r.URL.Query() {
 			api.QueryArgs[k] = strings.Join(vals, ", ")
 		}
 
-		// Read body for Lua access
+		// Read body for Lua access (up to 10MB limit).
+		// Replaced body reader so the proxy can still read it later.
 		bodyBytes, _ := io.ReadAll(io.LimitReader(r.Body, 10<<20))
 		r.Body = io.NopCloser(bytes.NewReader(bodyBytes))
 		api.Body = bodyBytes
 
-		// Create a cancellable context for the script
+		// Create a cancellable context for the script.
 		_, cancel := context.WithCancel(context.Background())
 		api.Cancel = cancel
 
-		// Run Lua scripts if any are loaded
+		// Run all loaded Lua scripts sequentially against the same api object.
+		// Scripts can modify the request, set response headers, or short-circuit.
 		for path, src := range cfg.LuaScripts {
 			log.Printf("running lua script: %s", path)
 			err := runner.Run(src, api)
@@ -501,14 +596,14 @@ func main() {
 				api.Blocked = true
 				break
 			}
-			// If script blocked (abort/redirect), short-circuit
+			// If script blocked (abort/redirect), stop running further scripts.
 			if api.Blocked {
 				cancel()
 				break
 			}
 		}
 
-		// If script produced a blocked response, send it directly
+		// If any script short-circuited (abort/redirect), send response directly.
 		if api.Blocked && api.Response != nil {
 			duration := time.Since(start)
 			state.mu.Lock()
@@ -531,9 +626,10 @@ func main() {
 			return
 		}
 
-		// Normal proxy: restore body and forward
+		// Normal flow: restore body and forward to upstream.
 		r.Body = io.NopCloser(bytes.NewReader(bodyBytes))
 
+		// Rewrite the outgoing request to point at the upstream.
 		proxy.Director = func(outReq *http.Request) {
 			outReq.URL.Scheme = upstream.Scheme
 			outReq.URL.Host = upstream.Host
@@ -546,8 +642,10 @@ func main() {
 			outReq.Host = upstream.Host
 		}
 
+		// After receiving the upstream response, merge any headers that Lua scripts
+		// set via setResponseHeader(). This allows scripts to inject security headers,
+		// logging info, etc. into proxied responses.
 		proxy.ModifyResponse = func(resp *http.Response) error {
-			// Merge headers set by Lua scripts (even when not short-circuiting)
 			if api.Response != nil && api.Response.Header != nil {
 				for k, vals := range api.Response.Header {
 					for _, v := range vals {
@@ -569,9 +667,10 @@ func main() {
 		cancel()
 	})
 
+	// Stats endpoint: GET /__proxy_stats__
 	http.HandleFunc("/__proxy_stats__", statsHandler)
 
-	// Graceful shutdown
+	// Graceful shutdown on SIGINT/SIGTERM.
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 
