@@ -1,5 +1,12 @@
 # go-lua-proxy
 
+> **Provenance.** This is one half of an A/B comparison: the same brief — "build a
+> Go reverse proxy with a per-request Lua scripting API" — was given to two models.
+> This repo holds the result from **DeepSeek V4 Flash**; the sibling
+> [go-lua-proxy-fn](https://github.com/sambouli/go-lua-proxy-fn) holds the result
+> from **QFN (Qwen3.8-Flash-Next)**. They are independent implementations of the
+> same task, kept apart so the outcomes can be compared directly.
+
 A lightweight HTTP reverse proxy written in Go that executes **Lua scripts** per-request, giving you programmatic control over routing, auth, headers, body transformation, and more — without leaving the Lua ecosystem.
 
 ## Quick start
